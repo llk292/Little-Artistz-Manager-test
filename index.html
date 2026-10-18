@@ -24,6 +24,7 @@ label{display:block;font-size:13px;color:var(--muted);margin:12px 0 5px}
 input,select,textarea{width:100%;border:1px solid var(--line);border-radius:10px;padding:11px;background:#fff;font:inherit;color:var(--ink)}
 textarea{min-height:70px}
 button{font:inherit;cursor:pointer}
+button:disabled{opacity:.5;cursor:not-allowed}
 .primary,.secondary,.danger{border:0;border-radius:10px;padding:11px 14px;margin-top:12px}
 .primary{background:var(--ink);color:white}
 .secondary{background:#eee7dd;color:var(--ink)}
@@ -47,7 +48,6 @@ footer{text-align:center;font-size:11px;color:var(--muted);padding:20px}
   <h1>Studio Manager</h1>
   <p>Your little studio, thoughtfully organised ♡</p>
 </header>
-
 <nav id="nav">
   <button data-page="today" class="active">Today</button>
   <button data-page="students">Students</button>
@@ -57,7 +57,7 @@ footer{text-align:center;font-size:11px;color:var(--muted);padding:20px}
   <button data-page="backup">Backup</button>
 </nav>
 <main id="app"></main>
-<footer>Little Artistz · Development version · Local browser storage</footer>
+<footer>Little Artistz · Local browser storage</footer>
 
 <script>
 (function(){
@@ -68,711 +68,424 @@ const KEYS={
  rules:"littleArtistzManager_recurringRules_v1",
  lessons:"littleArtistzManager_lessons_v1"
 };
-
-// Paste the OAuth 2.0 Web client ID here. Never add a Client Secret to this file.
 const GOOGLE_CLIENT_ID="891265178343-hdph9ia0uf0rrbc82d6iuvf8sg59p0eg.apps.googleusercontent.com";
 const GOOGLE_SCOPE="https://www.googleapis.com/auth/calendar.events";
 const GOOGLE_CALENDAR_ID="primary";
 const TIME_ZONE="Asia/Hong_Kong";
 const LESSON_DURATION_MINUTES=60;
+const RECONNECT_KEY="littleArtistzManager_googleReconnectEnabled_v1";
 
 function load(key){
-  try{
-    const value=JSON.parse(localStorage.getItem(key)||"[]");
-    return Array.isArray(value)?value:[];
-  }catch(e){return []}
+ try{const v=JSON.parse(localStorage.getItem(key)||"[]");return Array.isArray(v)?v:[]}
+ catch(e){return []}
 }
-let students=load(KEYS.students);
-let rules=load(KEYS.rules);
-let lessons=load(KEYS.lessons);
-let page="today";
-let editingStudent=null;
-let editingLesson=null;
-let googleTokenClient=null;
-let googleAccessToken=null;
-let googleTokenExpiresAt=0;
-let googleBusy=false;
-let googleMessage="尚未連接 Google Calendar。";
+let students=load(KEYS.students),rules=load(KEYS.rules),lessons=load(KEYS.lessons);
+let page="today",editingStudent=null,editingLesson=null;
+let googleTokenClient=null,googleAccessToken=null,googleTokenExpiresAt=0;
+let googleBusy=false,googleMessage="尚未連接 Google Calendar。";
+let googleSyncTimer=null,googleSyncRequested=false,googleReconnectAttempted=false;
 
 const app=document.getElementById("app");
 const weekdays=["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"];
 const todayISO=()=>localDate(new Date());
+
 function localDate(d){
-  return d.getFullYear()+"-"+String(d.getMonth()+1).padStart(2,"0")+"-"+String(d.getDate()).padStart(2,"0");
+ return d.getFullYear()+"-"+String(d.getMonth()+1).padStart(2,"0")+"-"+String(d.getDate()).padStart(2,"0");
 }
 function uid(){return Date.now().toString(36)+Math.random().toString(36).slice(2,8)}
 function esc(s){
-  return String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+ return String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 }
-
 function save(){
-  const entries = [
-    [KEYS.students, students],
-    [KEYS.rules, rules],
-    [KEYS.lessons, lessons]
-  ];
-
-  const previous = entries.map(([key]) => ({
-    key,
-    value: localStorage.getItem(key)
-  }));
-
-  try {
-    const serialized = entries.map(([key, value]) => [
-      key,
-      JSON.stringify(value)
-    ]);
-
-    serialized.forEach(([key, value]) => {
-      localStorage.setItem(key, value);
-    });
-  } catch (error) {
-    let restoreFailed = false;
-
-    previous.forEach(({key, value}) => {
-      try {
-        if (value === null) {
-          localStorage.removeItem(key);
-        } else {
-          localStorage.setItem(key, value);
-        }
-      } catch (restoreError) {
-        restoreFailed = true;
-      }
-    });
-
-    if (restoreFailed) {
-      throw new Error(
-        "Saving failed and previous data could not be fully restored. Do not reload or continue editing; export any recoverable data if possible."
-      );
-    }
-
-    throw new Error(
-      "Saving failed. The app attempted to restore the previous saved data. Please check the data before continuing."
-    );
-  }
+ const entries=[[KEYS.students,students],[KEYS.rules,rules],[KEYS.lessons,lessons]];
+ const previous=entries.map(([key])=>({key,value:localStorage.getItem(key)}));
+ try{
+  entries.forEach(([key,value])=>localStorage.setItem(key,JSON.stringify(value)));
+ }catch(error){
+  let restoreFailed=false;
+  previous.forEach(({key,value})=>{
+   try{if(value===null)localStorage.removeItem(key);else localStorage.setItem(key,value)}
+   catch(e){restoreFailed=true}
+  });
+  throw new Error(restoreFailed?
+   "儲存失敗，亦未能完全還原舊資料。請停止編輯並檢查備份。":
+   "儲存失敗。程式已嘗試還原舊資料，請檢查資料後再繼續。");
+ }
 }
-
 function studentName(id){
-  const s=students.find(x=>String(x.id)===String(id));
-  return s?s.name:"Unknown student";
+ const s=students.find(x=>String(x.id)===String(id));return s?s.name:"Unknown student";
 }
 function money(n){return "$"+(Number(n)||0)}
 function setPage(p){
-  page=p;
-  document.querySelectorAll("#nav button").forEach(b=>b.classList.toggle("active",b.dataset.page===p));
-  render();
+ page=p;document.querySelectorAll("#nav button").forEach(b=>b.classList.toggle("active",b.dataset.page===p));render();
 }
 document.getElementById("nav").addEventListener("click",e=>{
-  const b=e.target.closest("button[data-page]");
-  if(b)setPage(b.dataset.page);
+ const b=e.target.closest("button[data-page]");if(b)setPage(b.dataset.page);
 });
 function field(label,name,value="",type="text",required=false){
-  return `<label>${label}</label><input name="${name}" type="${type}" value="${esc(value)}" ${required?"required":""}>`;
+ return `<label>${label}</label><input name="${name}" type="${type}" value="${esc(value)}" ${required?"required":""}>`;
 }
 function selectField(label,name,options,value){
-  return `<label>${label}</label><select name="${name}">${options.map(o=>`<option value="${esc(o[0])}" ${String(o[0])===String(value)?"selected":""}>${esc(o[1])}</option>`).join("")}</select>`;
+ return `<label>${label}</label><select name="${name}">${options.map(o=>`<option value="${esc(o[0])}" ${String(o[0])===String(value)?"selected":""}>${esc(o[1])}</option>`).join("")}</select>`;
 }
-function studentOptions(){
-  return students.map(s=>[s.id,s.name]);
-}
+function studentOptions(){return students.map(s=>[s.id,s.name])}
 function render(){
-  if(page==="today")renderToday();
-  if(page==="students")renderStudents();
-  if(page==="recurring")renderRecurring();
-  if(page==="lessons")renderLessons();
-  if(page==="calendar")renderCalendar();
-  if(page==="backup")renderBackup();
+ if(page==="today")renderToday();
+ if(page==="students")renderStudents();
+ if(page==="recurring")renderRecurring();
+ if(page==="lessons")renderLessons();
+ if(page==="calendar")renderCalendar();
+ if(page==="backup")renderBackup();
 }
 function renderToday(){
-  const upcoming=lessons.filter(l=>l.status!=="Cancelled"&&l.date>=todayISO()).sort((a,b)=>(a.date+a.time).localeCompare(b.date+b.time)).slice(0,8);
-  app.innerHTML=`<h2>Hello, Miss YanYan ♡</h2>
-  <div class="sub">Your studio at a glance</div>
-  <div class="row">
-    <div class="card"><div class="meta">Active students</div><h2>${students.filter(s=>s.status==="Active").length}</h2></div>
-    <div class="card"><div class="meta">Saved lessons</div><h2>${lessons.length}</h2></div>
-  </div>
-  <div class="card"><div class="item-title">Upcoming lessons</div>
-  ${upcoming.length?upcoming.map(l=>`<div class="card"><b>${esc(l.date)} · ${esc(l.time||"Time not set")}</b><div>${esc(studentName(l.studentId))}</div><div class="meta">${esc(l.theme||"Theme not set")} · ${esc(l.location||"Location not set")}</div></div>`).join(""):`<div class="empty">No upcoming lessons yet.</div>`}
-  </div>
-  <div class="notice">Start by adding students, then create a recurring class and generate lessons for your chosen date range.</div>`;
+ const upcoming=lessons.filter(l=>l.status!=="Cancelled"&&l.date>=todayISO()).sort((a,b)=>(a.date+a.time).localeCompare(b.date+b.time)).slice(0,8);
+ app.innerHTML=`<h2>Hello, Miss YanYan ♡</h2><div class="sub">Your studio at a glance</div>
+ <div class="row"><div class="card"><div class="meta">Active students</div><h2>${students.filter(s=>s.status==="Active").length}</h2></div>
+ <div class="card"><div class="meta">Saved lessons</div><h2>${lessons.length}</h2></div></div>
+ <div class="card"><div class="item-title">Upcoming lessons</div>
+ ${upcoming.length?upcoming.map(l=>`<div class="card"><b>${esc(l.date)} · ${esc(l.time||"Time not set")}</b><div>${esc(studentName(l.studentId))}</div><div class="meta">${esc(l.theme||"Theme not set")} · ${esc(l.location||"Location not set")}</div></div>`).join(""):'<div class="empty">No upcoming lessons yet.</div>'}</div>
+ <div class="notice">Start by adding students, then create a recurring class and generate lessons for your chosen date range.</div>`;
 }
 function renderStudents(){
-  const editing=editingStudent?students.find(s=>String(s.id)===String(editingStudent)):null;
-  app.innerHTML=`<h2>Students</h2><div class="sub">Manage student profiles and individual lesson fees.</div>
-  <div class="card"><div class="item-title">${editing?"Edit student":"Add a student"}</div>
-  <form id="studentForm">
-  ${field("Student name","name",editing?.name||"", "text",true)}
-  <div class="row">${field("Age","age",editing?.age||"","text")}
-  ${field("Location","location",editing?.location||"")}</div>
-  <div class="row">
-  ${selectField("Class type","classType",[["group","Small group"],["1to1","1-to-1"]],editing?.classType||"group")}
-  ${field("Fee per lesson ($)","fee",editing?.fee??200,"number",true)}
-  </div>
-  <div class="row">
-  ${selectField("Payment type","paymentType",[["single","Single lesson"],["package4","4-lesson package"],["package10","10-lesson package"]],editing?.paymentType||"single")}
-  ${field("Package lessons remaining","packageRemaining",editing?.packageRemaining??0,"number")}
-  </div>
-  ${selectField("Status","status",[["Active","Active"],["Waiting List","Waiting List"],["Paused","Paused"],["Finished","Finished"],["Trial","Trial"]],editing?.status||"Active")}
-  <label>Notes</label><textarea name="notes">${esc(editing?.notes||"")}</textarea>
-  <button class="primary" type="submit">${editing?"Save changes":"Add student"}</button>
-  ${editing?'<button class="secondary" type="button" id="stopEdit">Cancel editing</button>':""}
-  </form></div>
-  <div class="card"><label>Search students</label><input id="studentSearch" placeholder="Search by name or location">
-  <div id="studentList">${studentList(students)}</div></div>`;
-  document.getElementById("studentForm").addEventListener("submit",e=>{
-    e.preventDefault();
-    const f=new FormData(e.currentTarget);
-    const data={
-      name:String(f.get("name")).trim(),age:String(f.get("age")||""),
-      location:String(f.get("location")||""),classType:f.get("classType"),
-      fee:Number(f.get("fee"))||0,paymentType:f.get("paymentType"),
-      packageRemaining:Math.max(0,Number(f.get("packageRemaining"))||0),
-      status:f.get("status"),notes:String(f.get("notes")||"")
-    };
-    if(!data.name){alert("Please enter a student name.");return}
-    if(editing){
-      Object.assign(editing,data);
-    }else{
-      students.push({id:uid(),...data});
-    }
-    editingStudent=null;save();renderStudents();
-  });
-  const stop=document.getElementById("stopEdit");
-  if(stop)stop.onclick=()=>{editingStudent=null;renderStudents()};
-  document.getElementById("studentSearch").addEventListener("input",e=>{
-    const q=e.target.value.toLowerCase();
-    document.getElementById("studentList").innerHTML=studentList(students.filter(s=>(s.name+" "+(s.location||"")).toLowerCase().includes(q)));
-    bindStudentActions();
-  });
-  bindStudentActions();
+ const editing=editingStudent?students.find(s=>String(s.id)===String(editingStudent)):null;
+ app.innerHTML=`<h2>Students</h2><div class="sub">Manage student profiles and individual lesson fees.</div>
+ <div class="card"><div class="item-title">${editing?"Edit student":"Add a student"}</div><form id="studentForm">
+ ${field("Student name","name",editing?.name||"","text",true)}
+ <div class="row">${field("Age","age",editing?.age||"")}${field("Location","location",editing?.location||"")}</div>
+ <div class="row">${selectField("Class type","classType",[["group","Small group"],["1to1","1-to-1"]],editing?.classType||"group")}${field("Fee per lesson ($)","fee",editing?.fee??200,"number",true)}</div>
+ <div class="row">${selectField("Payment type","paymentType",[["single","Single lesson"],["package4","4-lesson package"],["package10","10-lesson package"]],editing?.paymentType||"single")}${field("Package lessons remaining","packageRemaining",editing?.packageRemaining??0,"number")}</div>
+ ${selectField("Status","status",[["Active","Active"],["Waiting List","Waiting List"],["Paused","Paused"],["Finished","Finished"],["Trial","Trial"]],editing?.status||"Active")}
+ <label>Notes</label><textarea name="notes">${esc(editing?.notes||"")}</textarea>
+ <button class="primary" type="submit">${editing?"Save changes":"Add student"}</button>${editing?'<button class="secondary" type="button" id="stopEdit">Cancel editing</button>':""}</form></div>
+ <div class="card"><label>Search students</label><input id="studentSearch" placeholder="Search by name or location"><div id="studentList">${studentList(students)}</div></div>`;
+ document.getElementById("studentForm").addEventListener("submit",e=>{
+  e.preventDefault();const f=new FormData(e.currentTarget);
+  const data={name:String(f.get("name")).trim(),age:String(f.get("age")||""),location:String(f.get("location")||""),classType:f.get("classType"),fee:Number(f.get("fee"))||0,paymentType:f.get("paymentType"),packageRemaining:Math.max(0,Number(f.get("packageRemaining"))||0),status:f.get("status"),notes:String(f.get("notes")||"")};
+  if(!data.name){alert("Please enter a student name.");return}
+  try{if(editing)Object.assign(editing,data);else students.push({id:uid(),...data});save();editingStudent=null;renderStudents()}
+  catch(err){alert(err.message)}
+ });
+ const stop=document.getElementById("stopEdit");if(stop)stop.onclick=()=>{editingStudent=null;renderStudents()};
+ document.getElementById("studentSearch").addEventListener("input",e=>{
+  const q=e.target.value.toLowerCase();document.getElementById("studentList").innerHTML=studentList(students.filter(s=>(s.name+" "+(s.location||"")).toLowerCase().includes(q)));bindStudentActions();
+ });
+ bindStudentActions();
 }
 function studentList(list){
-  if(!list.length)return '<div class="empty">No students found.</div>';
-  return list.map(s=>`<div class="card">
-  <div class="item-title">${esc(s.name)}</div>
-  <div class="meta">Age: ${esc(s.age||"—")} · ${esc(s.location||"No location")}<br>
-  ${esc(s.classType==="1to1"?"1-to-1":"Small group")} · ${money(s.fee)} per lesson<br>
-  ${esc(({single:"Single lesson",package4:"4-lesson package",package10:"10-lesson package"})[s.paymentType]||s.paymentType||"Payment type not set")}
-  ${s.paymentType==="single"?"":` · ${Number(s.packageRemaining)||0} remaining`}<br>
-  Status: ${esc(s.status||"Active")}</div>
-  ${s.notes?`<div class="meta">${esc(s.notes)}</div>`:""}
-  <div class="actions"><button class="secondary" data-edit-student="${esc(s.id)}">Edit</button><button class="danger" data-delete-student="${esc(s.id)}">Delete</button></div>
-  </div>`).join("");
+ if(!list.length)return '<div class="empty">No students found.</div>';
+ return list.map(s=>`<div class="card"><div class="item-title">${esc(s.name)}</div><div class="meta">Age: ${esc(s.age||"—")} · ${esc(s.location||"No location")}<br>${esc(s.classType==="1to1"?"1-to-1":"Small group")} · ${money(s.fee)} per lesson<br>${esc(({single:"Single lesson",package4:"4-lesson package",package10:"10-lesson package"})[s.paymentType]||s.paymentType||"Payment type not set")}${s.paymentType==="single"?"":` · ${Number(s.packageRemaining)||0} remaining`}<br>Status: ${esc(s.status||"Active")}</div>${s.notes?`<div class="meta">${esc(s.notes)}</div>`:""}<div class="actions"><button class="secondary" data-edit-student="${esc(s.id)}">Edit</button><button class="danger" data-delete-student="${esc(s.id)}">Delete</button></div></div>`).join("");
 }
 function bindStudentActions(){
-  document.querySelectorAll("[data-edit-student]").forEach(b=>b.onclick=()=>{
-    editingStudent=b.dataset.editStudent;renderStudents();window.scrollTo(0,0);
-  });
-  document.querySelectorAll("[data-delete-student]").forEach(b=>b.onclick=()=>{
-    const id=b.dataset.deleteStudent;
-    if(lessons.some(l=>String(l.studentId)===String(id))){
-      alert("This student has lesson records. To preserve lesson history, change the student's status instead of deleting them.");return;
-    }
-    if(confirm("Delete this test student?")){
-      students=students.filter(x=>String(x.id)!==String(id));save();renderStudents();
-    }
-  });
+ document.querySelectorAll("[data-edit-student]").forEach(b=>b.onclick=()=>{editingStudent=b.dataset.editStudent;renderStudents();window.scrollTo(0,0)});
+ document.querySelectorAll("[data-delete-student]").forEach(b=>b.onclick=()=>{
+  const id=b.dataset.deleteStudent;
+  if(lessons.some(l=>String(l.studentId)===String(id))){alert("This student has lesson records. To preserve lesson history, change the student's status instead of deleting them.");return}
+  if(confirm("Delete this student?")){students=students.filter(x=>String(x.id)!==String(id));try{save();renderStudents()}catch(e){alert(e.message)}}
+ });
 }
 function renderRecurring(){
-  if(!students.length){
-    app.innerHTML='<h2>Recurring Classes</h2><div class="notice">Please add a student first, then return here to create a recurring class.</div>';return;
-  }
-  app.innerHTML=`<h2>Recurring Classes</h2><div class="sub">Set a weekly class and generate lessons for a date range.</div>
-  <div class="card"><div class="item-title">Create recurring class</div>
-  <form id="ruleForm">
-  ${selectField("Student","studentId",studentOptions(),"")}
-  ${selectField("Weekly class day","weekday",weekdays.map((d,i)=>[i,d]),1)}
-  <div class="row">${field("Class time","time","16:00","time",true)}${field("Location","location","","text",true)}</div>
-  ${field("Lesson theme","theme","","text",true)}
-  <div class="row">${field("Generate from","startDate",todayISO(),"date",true)}${field("Generate until","endDate",todayISO(),"date",true)}</div>
-  <button class="primary" type="submit">Create class & generate lessons</button>
-  </form></div>
-  <div id="ruleList">${ruleList()}</div>
-  <div class="notice">Generating lessons again for the same class will skip dates already created. Edit or cancel individual lessons from the Lessons tab.</div>`;
-  document.getElementById("ruleForm").addEventListener("submit",e=>{
-    e.preventDefault();
-    const f=new FormData(e.currentTarget);
-    const start=String(f.get("startDate")),end=String(f.get("endDate"));
-    if(end<start){alert("The end date must be on or after the start date.");return}
-    const student=students.find(s=>String(s.id)===String(f.get("studentId")));
-    if(!student){alert("Please select a student.");return}
-    const rule={
-      id:uid(),studentId:student.id,weekday:Number(f.get("weekday")),
-      time:String(f.get("time")),location:String(f.get("location")).trim(),
-      theme:String(f.get("theme")).trim(),startDate:start,endDate:end,active:true
-    };
-    rules.push(rule);
-    const added=generateLessons(rule,start,end);
-    save();renderRecurring();
-    alert("Recurring class saved. "+added+" new lesson(s) generated. Open Google Calendar to sync them.");
-  });
-  bindRuleActions();
+ if(!students.length){app.innerHTML='<h2>Recurring Classes</h2><div class="notice">Please add a student first, then return here to create a recurring class.</div>';return}
+ app.innerHTML=`<h2>Recurring Classes</h2><div class="sub">Set a weekly class and generate lessons for a date range.</div>
+ <div class="card"><div class="item-title">Create recurring class</div><form id="ruleForm">
+ ${selectField("Student","studentId",studentOptions(),"")}${selectField("Weekly class day","weekday",weekdays.map((d,i)=>[i,d]),1)}
+ <div class="row">${field("Class time","time","16:00","time",true)}${field("Location","location","","text",true)}</div>
+ ${field("Lesson theme","theme","","text",true)}<div class="row">${field("Generate from","startDate",todayISO(),"date",true)}${field("Generate until","endDate",todayISO(),"date",true)}</div>
+ <button class="primary" type="submit">Create class & generate lessons</button></form></div>
+ <div id="ruleList">${ruleList()}</div><div class="notice">Existing dates are skipped when generating lessons again. Edit or cancel individual lessons from the Lessons tab.</div>`;
+ document.getElementById("ruleForm").addEventListener("submit",e=>{
+  e.preventDefault();const f=new FormData(e.currentTarget),start=String(f.get("startDate")),end=String(f.get("endDate"));
+  if(end<start){alert("The end date must be on or after the start date.");return}
+  const student=students.find(s=>String(s.id)===String(f.get("studentId")));if(!student){alert("Please select a student.");return}
+  const rule={id:uid(),studentId:student.id,weekday:Number(f.get("weekday")),time:String(f.get("time")),location:String(f.get("location")).trim(),theme:String(f.get("theme")).trim(),startDate:start,endDate:end,active:true};
+  rules.push(rule);const added=generateLessons(rule,start,end);
+  try{save();renderRecurring();queueCalendarSync();alert("Recurring class saved. "+added+" new lesson(s) generated. Calendar sync has been queued if connected.")}
+  catch(err){alert(err.message)}
+ });
+ bindRuleActions();
 }
 function ruleList(){
-  if(!rules.length)return '<div class="empty">No recurring classes yet.</div>';
-  return rules.map(r=>`<div class="card">
-  <div class="item-title">${esc(studentName(r.studentId))}</div>
-  <div class="meta">${esc(weekdays[r.weekday]||"")} · ${esc(r.time)}<br>${esc(r.location)}<br>Theme: ${esc(r.theme)}<br>Initial date range: ${esc(r.startDate)} to ${esc(r.endDate)}</div>
-  <span class="badge">${r.active?"Active":"Paused"}</span>
-  <div class="actions">
-  <button class="secondary" data-extend-rule="${esc(r.id)}">Generate more dates</button>
-  <button class="secondary" data-toggle-rule="${esc(r.id)}">${r.active?"Pause rule":"Activate rule"}</button>
-  </div></div>`).join("");
+ if(!rules.length)return '<div class="empty">No recurring classes yet.</div>';
+ return rules.map(r=>`<div class="card"><div class="item-title">${esc(studentName(r.studentId))}</div><div class="meta">${esc(weekdays[r.weekday]||"")} · ${esc(r.time)}<br>${esc(r.location)}<br>Theme: ${esc(r.theme)}<br>Initial date range: ${esc(r.startDate)} to ${esc(r.endDate)}</div><span class="badge">${r.active?"Active":"Paused"}</span><div class="actions"><button class="secondary" data-extend-rule="${esc(r.id)}">Generate more dates</button><button class="secondary" data-toggle-rule="${esc(r.id)}">${r.active?"Pause rule":"Activate rule"}</button></div></div>`).join("");
 }
 function bindRuleActions(){
-  document.querySelectorAll("[data-toggle-rule]").forEach(b=>b.onclick=()=>{
-    const r=rules.find(x=>String(x.id)===b.dataset.toggleRule);if(!r)return;
-    r.active=!r.active;save();renderRecurring();
-  });
-  document.querySelectorAll("[data-extend-rule]").forEach(b=>b.onclick=()=>{
-    const r=rules.find(x=>String(x.id)===b.dataset.extendRule);if(!r)return;
-    const from=prompt("Generate from date (YYYY-MM-DD)",todayISO());if(!from)return;
-    const until=prompt("Generate until date (YYYY-MM-DD)",r.endDate);if(!until)return;
-    if(!/^\d{4}-\d{2}-\d{2}$/.test(from)||!/^\d{4}-\d{2}-\d{2}$/.test(until)||until<from){
-      alert("Please enter valid dates in YYYY-MM-DD format.");return;
-    }
-    const count=generateLessons(r,from,until);
-    r.startDate=from;r.endDate=until;save();renderRecurring();
-    alert(count+" new lesson(s) generated. Existing dates were skipped. Open Google Calendar to sync them.");
-  });
+ document.querySelectorAll("[data-toggle-rule]").forEach(b=>b.onclick=()=>{const r=rules.find(x=>String(x.id)===b.dataset.toggleRule);if(!r)return;r.active=!r.active;try{save();renderRecurring()}catch(e){alert(e.message)}});
+ document.querySelectorAll("[data-extend-rule]").forEach(b=>b.onclick=()=>{
+  const r=rules.find(x=>String(x.id)===b.dataset.extendRule);if(!r)return;
+  const from=prompt("Generate from date (YYYY-MM-DD)",todayISO());if(!from)return;
+  const until=prompt("Generate until date (YYYY-MM-DD)",r.endDate);if(!until)return;
+  if(!/^\d{4}-\d{2}-\d{2}$/.test(from)||!/^\d{4}-\d{2}-\d{2}$/.test(until)||until<from){alert("Please enter valid dates in YYYY-MM-DD format.");return}
+  const count=generateLessons(r,from,until);r.startDate=from;r.endDate=until;
+  try{save();renderRecurring();queueCalendarSync();alert(count+" new lesson(s) generated. Sync has been queued if connected.")}
+  catch(e){alert(e.message)}
+ });
 }
 function generateLessons(r,start,end){
-  let count=0;
-  const d=new Date(start+"T12:00:00");
-  const last=new Date(end+"T12:00:00");
-  while(d<=last){
-    if(d.getDay()===Number(r.weekday)){
-      const date=localDate(d);
-      const exists=lessons.some(l=>String(l.ruleId)===String(r.id)&&l.date===date);
-      if(!exists){
-        const s=students.find(x=>String(x.id)===String(r.studentId));
-        lessons.push({
-          id:uid(),ruleId:r.id,studentId:r.studentId,date,time:r.time,
-          location:r.location,theme:r.theme,status:"Scheduled",
-          attendance:"Not marked",
-          payment:s&&s.paymentType!=="single"?"Deduct package":"Unpaid",
-          fee:s?Number(s.fee)||0:0,type:"Regular",notes:""
-        });
-        count++;
-      }
-    }
-    d.setDate(d.getDate()+1);
+ let count=0;const d=new Date(start+"T12:00:00"),last=new Date(end+"T12:00:00");
+ while(d<=last){
+  if(d.getDay()===Number(r.weekday)){
+   const date=localDate(d),exists=lessons.some(l=>String(l.ruleId)===String(r.id)&&l.date===date);
+   if(!exists){
+    const s=students.find(x=>String(x.id)===String(r.studentId));
+    lessons.push({id:uid(),ruleId:r.id,studentId:r.studentId,date,time:r.time,location:r.location,theme:r.theme,status:"Scheduled",attendance:"Not marked",payment:s&&s.paymentType!=="single"?"Deduct package":"Unpaid",fee:s?Number(s.fee)||0:0,type:"Regular",notes:""});
+    count++;
+   }
   }
-  return count;
+  d.setDate(d.getDate()+1);
+ }
+ return count;
 }
 function renderLessons(){
-  const sorted=[...lessons].sort((a,b)=>(a.date+a.time).localeCompare(b.date+b.time));
-  const editing=editingLesson?lessons.find(x=>String(x.id)===String(editingLesson)):null;
-  app.innerHTML=`<h2>Lessons</h2><div class="sub">Lesson records are retained when cancelled.</div>
-  <div class="card"><div class="item-title">All lessons (${lessons.length})</div>
-  ${sorted.length?sorted.map(l=>`<div class="card">
-  <div class="item-title">${esc(l.date)} · ${esc(l.time||"No time")}</div>
-  <div>${esc(studentName(l.studentId))}</div>
-  <div class="meta">${esc(l.location||"No location")}<br>Theme: ${esc(l.theme||"Not set")}<br>Fee: ${money(l.fee)} · Payment: ${esc(l.payment||"Unpaid")}<br>Attendance: ${esc(l.attendance||"Not marked")}${l.googleCalendarEventId?"<br>Google Calendar: linked":""}</div>
-  <span class="badge">${esc(l.status)}</span>
-  <div class="actions">
-  ${l.status!=="Cancelled"?`<button class="danger" data-cancel-lesson="${esc(l.id)}">Cancel lesson</button>`:""}
-  <button class="secondary" data-edit-lesson="${esc(l.id)}">Edit record</button>
-  </div></div>`).join(""):'<div class="empty">No lessons yet. Create a recurring class to generate lessons.</div>'}
-  </div>
-  ${editing?`<div class="card"><div class="item-title">Edit lesson</div>
-  <form id="editLessonForm">
-  <div class="row">${field("Lesson date","date",editing.date||todayISO(),"date",true)}${field("Lesson time","time",editing.time||"16:00","time",true)}</div>
-  ${field("Location","location",editing.location||"","text",true)}
-  ${field("Lesson theme","theme",editing.theme||"","text",true)}
-  ${selectField("Attendance", "attendance", [["Not marked","Not marked"],["Present","Present"],["Absent","Absent"],["Makeup","Makeup"]], editing.attendance||"Not marked")}
-  ${selectField("Payment", "payment", [["Unpaid","Unpaid"],["Paid","Paid"],["Deduct package","Deduct package"],["Trial","Trial"],["Makeup","Makeup"]], editing.payment||"Unpaid")}
-  <button class="primary" type="submit">Save changes</button><button class="secondary" type="button" id="cancelEditLesson">Cancel editing</button>
-  </form></div>`:""}
-  <div class="card"><div class="item-title">Add a single lesson</div>
-  ${students.length?`<form id="singleForm">
-  ${selectField("Student","studentId",studentOptions(),"")}
-  <div class="row">${field("Date","date",todayISO(),"date",true)}${field("Time","time","16:00","time",true)}</div>
-  ${field("Location","location","","text",true)}
-  ${field("Theme","theme","","text",true)}
-  <button class="primary" type="submit">Add single lesson</button></form>`:'<div class="empty">Add a student first.</div>'}
-  </div>`;
-  document.querySelectorAll("[data-cancel-lesson]").forEach(b=>b.onclick=()=>{
-    const l=lessons.find(x=>String(x.id)===b.dataset.cancelLesson);if(!l)return;
-    if(confirm("Mark this lesson as cancelled? The record will be kept.")){
-      l.status="Cancelled";save();renderLessons();
-      if(l.googleCalendarEventId)alert("This lesson is marked cancelled in the app. Open Google Calendar and press Sync to remove its linked event.");
-    }
-  });
-  document.querySelectorAll("[data-edit-lesson]").forEach(b=>b.onclick=()=>{
-    editingLesson=b.dataset.editLesson;renderLessons();
-    const form=document.getElementById("editLessonForm");if(form)form.scrollIntoView({behavior:"smooth",block:"start"});
-  });
-  const cancelEdit=document.getElementById("cancelEditLesson");
-  if(cancelEdit)cancelEdit.onclick=()=>{editingLesson=null;renderLessons()};
-  const ef=document.getElementById("editLessonForm");
-  if(ef)ef.addEventListener("submit",e=>{
-    e.preventDefault();const f=new FormData(ef);
-    const date=String(f.get("date")||"");const time=String(f.get("time")||"");
-    if(!/^\d{4}-\d{2}-\d{2}$/.test(date)||!/^\d{2}:\d{2}$/.test(time)){alert("Please choose a valid date and time.");return}
-    const l=lessons.find(x=>String(x.id)===String(editingLesson));if(!l)return;
-    l.date=date;l.time=time;l.location=String(f.get("location")||"").trim();l.theme=String(f.get("theme")||"").trim();
-    l.attendance=String(f.get("attendance")||"Not marked");l.payment=String(f.get("payment")||"Unpaid");
-    editingLesson=null;save();renderLessons();
-    if(l.googleCalendarEventId)alert("Record updated. Open Google Calendar and press Sync to update the linked event.");
-  });
-  const sf=document.getElementById("singleForm");
-  if(sf)sf.addEventListener("submit",e=>{
-    e.preventDefault();const f=new FormData(sf);
-    const s=students.find(x=>String(x.id)===String(f.get("studentId")));if(!s)return;
-    lessons.push({
-      id:uid(),ruleId:null,studentId:s.id,date:String(f.get("date")),time:String(f.get("time")),
-      location:String(f.get("location")).trim(),theme:String(f.get("theme")).trim(),
-      status:"Scheduled",attendance:"Not marked",
-      payment:s.paymentType!=="single"?"Deduct package":"Unpaid",
-      fee:Number(s.fee)||0,type:"Single",notes:""
-    });
-    save();renderLessons();alert("Single lesson added. Open Google Calendar to sync it.");
-  });
+ const sorted=[...lessons].sort((a,b)=>(a.date+a.time).localeCompare(b.date+b.time));
+ const editing=editingLesson?lessons.find(x=>String(x.id)===String(editingLesson)):null;
+ app.innerHTML=`<h2>Lessons</h2><div class="sub">Lesson records are retained when cancelled.</div>
+ <div class="card"><div class="item-title">All lessons (${lessons.length})</div>
+ ${sorted.length?sorted.map(l=>`<div class="card"><div class="item-title">${esc(l.date)} · ${esc(l.time||"No time")}</div><div>${esc(studentName(l.studentId))}</div><div class="meta">${esc(l.location||"No location")}<br>Theme: ${esc(l.theme||"Not set")}<br>Fee: ${money(l.fee)} · Payment: ${esc(l.payment||"Unpaid")}<br>Attendance: ${esc(l.attendance||"Not marked")}${l.googleCalendarEventId?"<br>Google Calendar: linked":""}${l.googleCalendarSyncStatus?`<br>Sync status: ${esc(l.googleCalendarSyncStatus)}`:""}</div><span class="badge">${esc(l.status)}</span><div class="actions">${l.status!=="Cancelled"?`<button class="danger" data-cancel-lesson="${esc(l.id)}">Cancel lesson</button>`:""}<button class="secondary" data-edit-lesson="${esc(l.id)}">Edit record</button></div></div>`).join(""):'<div class="empty">No lessons yet. Create a recurring class to generate lessons.</div>'}</div>
+ ${editing?`<div class="card"><div class="item-title">Edit lesson</div><form id="editLessonForm"><div class="row">${field("Lesson date","date",editing.date||todayISO(),"date",true)}${field("Lesson time","time",editing.time||"16:00","time",true)}</div>${field("Location","location",editing.location||"","text",true)}${field("Lesson theme","theme",editing.theme||"","text",true)}${selectField("Attendance","attendance",[["Not marked","Not marked"],["Present","Present"],["Absent","Absent"],["Makeup","Makeup"]],editing.attendance||"Not marked")}${selectField("Payment","payment",[["Unpaid","Unpaid"],["Paid","Paid"],["Deduct package","Deduct package"],["Trial","Trial"],["Makeup","Makeup"]],editing.payment||"Unpaid")}<button class="primary" type="submit">Save changes</button><button class="secondary" type="button" id="cancelEditLesson">Cancel editing</button></form></div>`:""}
+ <div class="card"><div class="item-title">Add a single lesson</div>${students.length?`<form id="singleForm">${selectField("Student","studentId",studentOptions(),"")}<div class="row">${field("Date","date",todayISO(),"date",true)}${field("Time","time","16:00","time",true)}</div>${field("Location","location","","text",true)}${field("Theme","theme","","text",true)}<button class="primary" type="submit">Add single lesson</button></form>`:'<div class="empty">Add a student first.</div>'}</div>`;
+ document.querySelectorAll("[data-cancel-lesson]").forEach(b=>b.onclick=()=>{
+  const l=lessons.find(x=>String(x.id)===b.dataset.cancelLesson);if(!l)return;
+  if(confirm("Mark this lesson as cancelled? The record will be kept.")){
+   l.status="Cancelled";l.googleCalendarSyncStatus="Pending cancellation";
+   try{save();renderLessons();queueCalendarSync()}catch(e){alert(e.message)}
+  }
+ });
+ document.querySelectorAll("[data-edit-lesson]").forEach(b=>b.onclick=()=>{editingLesson=b.dataset.editLesson;renderLessons();const form=document.getElementById("editLessonForm");if(form)form.scrollIntoView({behavior:"smooth",block:"start"})});
+ const cancelEdit=document.getElementById("cancelEditLesson");if(cancelEdit)cancelEdit.onclick=()=>{editingLesson=null;renderLessons()};
+ const ef=document.getElementById("editLessonForm");
+ if(ef)ef.addEventListener("submit",e=>{
+  e.preventDefault();const f=new FormData(ef),date=String(f.get("date")||""),time=String(f.get("time")||"");
+  if(!/^\d{4}-\d{2}-\d{2}$/.test(date)||!/^\d{2}:\d{2}$/.test(time)){alert("Please choose a valid date and time.");return}
+  const l=lessons.find(x=>String(x.id)===String(editingLesson));if(!l)return;
+  l.date=date;l.time=time;l.location=String(f.get("location")||"").trim();l.theme=String(f.get("theme")||"").trim();l.attendance=String(f.get("attendance")||"Not marked");l.payment=String(f.get("payment")||"Unpaid");l.googleCalendarSyncStatus="Pending update";
+  try{editingLesson=null;save();renderLessons();queueCalendarSync()}catch(err){alert(err.message)}
+ });
+ const sf=document.getElementById("singleForm");
+ if(sf)sf.addEventListener("submit",e=>{
+  e.preventDefault();const f=new FormData(sf),s=students.find(x=>String(x.id)===String(f.get("studentId")));if(!s)return;
+  lessons.push({id:uid(),ruleId:null,studentId:s.id,date:String(f.get("date")),time:String(f.get("time")),location:String(f.get("location")).trim(),theme:String(f.get("theme")).trim(),status:"Scheduled",attendance:"Not marked",payment:s.paymentType!=="single"?"Deduct package":"Unpaid",fee:Number(s.fee)||0,type:"Single",notes:""});
+  try{save();renderLessons();queueCalendarSync()}catch(err){alert(err.message)}
+ });
 }
 
-/* Google Calendar integration: OAuth token is held in memory only, never saved to localStorage. */
+/* Google Calendar: OAuth tokens are never stored in localStorage. */
 function renderCalendar(){
-  const clientReady=GOOGLE_CLIENT_ID!=="PASTE_YOUR_GOOGLE_OAUTH_CLIENT_ID_HERE"&&GOOGLE_CLIENT_ID.endsWith(".apps.googleusercontent.com");
-  const linked=lessons.filter(l=>l.googleCalendarEventId).length;
-  const pending=lessons.filter(l=>!l.googleCalendarEventId&&l.status!=="Cancelled").length;
-  app.innerHTML=`<h2>Google Calendar</h2>
-  <div class="sub">Sync lesson records to your Google Calendar and use calendar notifications.</div>
-  <div class="notice"><b>Before connecting:</b> This app will request permission to create, update and delete calendar events. The OAuth Client ID is public; never paste a Client Secret into this page. Events use Hong Kong time and are set to 60 minutes.</div>
-  <div class="card">
-    <div class="item-title">Connection status</div>
-    <div class="meta" id="calendarStatus">${esc(googleMessage)}</div>
-    ${!clientReady?'<div class="notice" style="margin-top:12px">The OAuth Client ID has not been added to the code yet. Replace the placeholder in index.html with your Web application Client ID before using this feature.</div>':""}
-    <div class="actions">
-      <button class="primary" id="connectGoogle" ${(!clientReady||googleBusy)?"disabled":""}>Connect Google Calendar</button>
-      <button class="secondary" id="syncGoogle" ${(!clientReady||googleBusy)?"disabled":""}>Sync lessons now</button>
-    </div>
-    <div class="meta">Linked lesson events: ${linked}<br>Lessons waiting to sync: ${pending}</div>
-  </div>
-  <div class="card">
-    <div class="item-title">Reminder settings</div>
-    <div class="meta">Each synced event is configured with Google Calendar pop-up reminders:<br>• 1 day before (1,440 minutes)<br>• 30 minutes before class</div>
-  </div>
-  <div class="notice">Important: reminders depend on your Google Calendar notification settings and the Google Calendar app being allowed to send notifications on your iPhone. Please test with a dummy lesson first. Sync is manual for now; after adding or editing lessons, return here and tap “Sync lessons now”.</div>`;
-  const connect=document.getElementById("connectGoogle");
-  const sync=document.getElementById("syncGoogle");
-  if(connect)connect.onclick=()=>connectGoogle();
-  if(sync)sync.onclick=()=>startSync();
+ const clientReady=GOOGLE_CLIENT_ID.endsWith(".apps.googleusercontent.com");
+ const linked=lessons.filter(l=>l.googleCalendarEventId).length;
+ const pending=lessons.filter(l=>!l.googleCalendarEventId&&l.status!=="Cancelled"||l.status==="Cancelled"&&l.googleCalendarEventId).length;
+ app.innerHTML=`<h2>Google Calendar</h2><div class="sub">Automatic lesson sync and calendar reminders.</div>
+ <div class="notice"><b>Permission:</b> Google Calendar access is used to create, update and remove events. Events use Hong Kong time and last 60 minutes. OAuth access tokens are not saved in browser storage.</div>
+ <div class="card"><div class="item-title">Connection status</div><div class="meta" id="calendarStatus">${esc(googleMessage)}</div>
+ <div class="actions"><button class="primary" id="connectGoogle" ${(!clientReady||googleBusy)?"disabled":""}>Connect / reconnect Google Calendar</button><button class="secondary" id="syncGoogle" ${(!clientReady||googleBusy)?"disabled":""}>Sync lessons now</button></div>
+ <div class="meta">Linked events: ${linked}<br>Lessons needing attention: ${pending}<br>Automatic sync: ${googleAccessToken&&Date.now()<googleTokenExpiresAt?"Connected session":"Requires active authorization"}</div></div>
+ <div class="card"><div class="item-title">Reminder settings</div><div class="meta">Each synced event requests pop-up reminders 1 day before and 30 minutes before class. Your Google Calendar and iPhone notification settings must allow alerts.</div></div>
+ <div class="notice">The page cannot run while closed. If access expires or the page reloads, reconnect when prompted. Review imported or restored backup data before syncing.</div>`;
+ document.getElementById("connectGoogle").onclick=()=>connectGoogle();
+ document.getElementById("syncGoogle").onclick=()=>startSync(false);
+}
+function queueCalendarSync(){
+ googleSyncRequested=true;
+ if(!googleAccessToken||Date.now()>=googleTokenExpiresAt){
+  googleMessage="課堂變更已儲存，等待 Google Calendar 授權後同步。";
+  if(page==="calendar")renderCalendar();
+  return;
+ }
+ clearTimeout(googleSyncTimer);
+ googleMessage="已安排自動同步…";
+ if(page==="calendar")renderCalendar();
+ googleSyncTimer=setTimeout(()=>startSync(true),1200);
 }
 function loadGoogleIdentity(){
-  return new Promise((resolve,reject)=>{
-    let tries=0;
-    const check=()=>{
-      if(window.google&&google.accounts&&google.accounts.oauth2)return resolve();
-      if(tries++>40)return reject(new Error("Google sign-in library did not load. Check your internet connection and refresh the page."));
-      setTimeout(check,250);
-    };
-    check();
-  });
+ return new Promise((resolve,reject)=>{
+  let tries=0;
+  const check=()=>{
+   if(window.google&&google.accounts&&google.accounts.oauth2)return resolve();
+   if(tries++>40)return reject(new Error("Google sign-in library did not load. Check your internet connection and refresh the page."));
+   setTimeout(check,250);
+  };check();
+ });
 }
 async function connectGoogle(){
-  if(GOOGLE_CLIENT_ID==="PASTE_YOUR_GOOGLE_OAUTH_CLIENT_ID_HERE"){alert("First add your Google OAuth Client ID to the code.");return}
-  try{
-    await loadGoogleIdentity();
-    googleTokenClient=google.accounts.oauth2.initTokenClient({
-      client_id:GOOGLE_CLIENT_ID,
-      scope:GOOGLE_SCOPE,
-      callback:async(response)=>{
-        if(response.error){googleMessage="Google authorization failed: "+response.error;renderCalendar();return}
-        googleAccessToken=response.access_token;
-        googleTokenExpiresAt=Date.now()+(Number(response.expires_in||3600)-60)*1000;
-        googleMessage="Connected for this browser session. You can now sync lessons.";
-        renderCalendar();
-        alert("Google Calendar connected. Next, tap “Sync lessons now”.");
-      },
-      error_callback:(error)=>{
-        googleMessage="Google sign-in was closed or blocked. Please try again.";
-        renderCalendar();
-        console.error(error);
-      }
-    });
-    googleTokenClient.requestAccessToken({prompt:"consent"});
-  }catch(e){
-    alert("Could not start Google sign-in: "+e.message);
-  }
+ try{
+  await loadGoogleIdentity();
+  googleTokenClient=google.accounts.oauth2.initTokenClient({
+   client_id:GOOGLE_CLIENT_ID,scope:GOOGLE_SCOPE,
+   callback:async response=>{
+    if(response.error){googleMessage="Google authorization failed: "+response.error;renderCalendar();return}
+    googleAccessToken=response.access_token;
+    googleTokenExpiresAt=Date.now()+(Number(response.expires_in||3600)-60)*1000;
+    try{localStorage.setItem(RECONNECT_KEY,"1")}catch(e){}
+    googleMessage="已連接 Google Calendar，正在同步課堂。";
+    googleSyncRequested=true;
+    renderCalendar();
+    await startSync(true);
+   },
+   error_callback:error=>{
+    googleMessage="Google 登入視窗已關閉或被封鎖，請再試一次。";renderCalendar();console.error(error);
+   }
+  });
+  googleTokenClient.requestAccessToken({prompt:"consent"});
+ }catch(e){alert("Could not start Google sign-in: "+e.message)}
 }
 function getToken(){
-  if(googleAccessToken&&Date.now()<googleTokenExpiresAt)return googleAccessToken;
-  throw new Error("Google authorization has expired or is not connected. Tap “Connect Google Calendar” first.");
+ if(googleAccessToken&&Date.now()<googleTokenExpiresAt)return googleAccessToken;
+ throw new Error("Google authorization has expired. Reconnect Google Calendar and sync again.");
 }
-function eventPayload(l){
-  const start=l.date+"T"+(l.time||"16:00")+":00";
-  const endDate=new Date(l.date+"T"+(l.time||"16:00")+":00");
-  endDate.setMinutes(endDate.getMinutes()+LESSON_DURATION_MINUTES);
-  const end=localDate(endDate)+"T"+String(endDate.getHours()).padStart(2,"0")+":"+String(endDate.getMinutes()).padStart(2,"0")+":00";
-  const title="Little Artistz · "+studentName(l.studentId)+" · "+(l.theme||"Art lesson");
-  const description=[
-    "Student: "+studentName(l.studentId),
-    "Theme: "+(l.theme||"Not set"),
-    "Location: "+(l.location||"Not set"),
-    "Lesson record ID: "+l.id,
-    "Created by Little Artistz Manager"
-  ].join("\n");
-  return {
-    summary:title,location:l.location||"",
-    description,
-    start:{dateTime:start+"+08:00",timeZone:TIME_ZONE},
-    end:{dateTime:end+"+08:00",timeZone:TIME_ZONE},
-    reminders:{useDefault:false,overrides:[{method:"popup",minutes:1440},{method:"popup",minutes:30}]},
-    extendedProperties:{private:{littleArtistzLessonId:String(l.id)}}
-  };
+function eventPayload(l,eventId){
+ const start=l.date+"T"+(l.time||"16:00")+":00";
+ const endDate=new Date(l.date+"T"+(l.time||"16:00")+":00");
+ endDate.setMinutes(endDate.getMinutes()+LESSON_DURATION_MINUTES);
+ const end=localDate(endDate)+"T"+String(endDate.getHours()).padStart(2,"0")+":"+String(endDate.getMinutes()).padStart(2,"0")+":00";
+ const payload={
+  summary:"Little Artistz · "+studentName(l.studentId)+" · "+(l.theme||"Art lesson"),
+  location:l.location||"",
+  description:["Student: "+studentName(l.studentId),"Theme: "+(l.theme||"Not set"),"Location: "+(l.location||"Not set"),"Lesson record ID: "+l.id,"Created by Little Artistz Manager"].join("\n"),
+  start:{dateTime:start+"+08:00",timeZone:TIME_ZONE},
+  end:{dateTime:end+"+08:00",timeZone:TIME_ZONE},
+  reminders:{useDefault:false,overrides:[{method:"popup",minutes:1440},{method:"popup",minutes:30}]},
+  extendedProperties:{private:{littleArtistzLessonId:String(l.id)}}
+ };
+ if(eventId)payload.id=eventId;
+ return payload;
+}
+/* Google event IDs only use a-v and 0-9. This deterministic ID helps retries avoid duplicate creation. */
+function stableEventId(id){
+ const s=String(id);
+ let h1=2166136261,h2=2246822519;
+ for(let i=0;i<s.length;i++){
+  const c=s.charCodeAt(i);
+  h1=Math.imul(h1^c,16777619);
+  h2=Math.imul(h2^c,3266489917);
+ }
+ const hex=n=>(n>>>0).toString(16).padStart(8,"0");
+ return "la"+hex(h1)+hex(h2);
 }
 async function calendarRequest(method,path,body){
-  const token=getToken();
-  const response=await fetch("https://www.googleapis.com/calendar/v3"+path,{
-    method,
-    headers:{"Authorization":"Bearer "+token,"Content-Type":"application/json"},
-    body:body?JSON.stringify(body):undefined
-  });
-  if(response.status===204)return null;
-  const text=await response.text();
-  let data={};
-  try{data=text?JSON.parse(text):{}}catch(e){}
-  if(!response.ok){
-    const message=data?.error?.message||("Google Calendar API error "+response.status);
-    throw new Error(message);
-  }
-  return data;
+ const token=getToken();
+ const response=await fetch("https://www.googleapis.com/calendar/v3"+path,{
+  method,headers:{"Authorization":"Bearer "+token,"Content-Type":"application/json"},
+  body:body?JSON.stringify(body):undefined
+ });
+ if(response.status===204)return null;
+ const text=await response.text();let data={};
+ try{data=text?JSON.parse(text):{}}catch(e){}
+ if(!response.ok){
+  const err=new Error(data?.error?.message||("Google Calendar API error "+response.status));
+  err.status=response.status;throw err;
+ }
+ return data;
 }
-async function startSync(){
-  if(googleBusy)return;
-  if(!googleAccessToken||Date.now()>=googleTokenExpiresAt){
-    alert("Please tap “Connect Google Calendar” first. Google access is kept only for this browser session.");
-    return;
-  }
-  googleBusy=true;renderCalendar();
-  let created=0,updated=0,deleted=0,failed=0;
-  const failures=[];
-  try{
-    for(const l of lessons){
+async function startSync(silent=false){
+ if(googleBusy){googleSyncRequested=true;return}
+ if(!googleAccessToken||Date.now()>=googleTokenExpiresAt){
+  googleMessage="請先連接 Google Calendar。課堂變更仍保留在本機。";
+  if(!silent)alert(googleMessage);
+  if(page==="calendar")renderCalendar();
+  return;
+ }
+ clearTimeout(googleSyncTimer);
+ googleBusy=true;googleSyncRequested=false;
+ if(page==="calendar")renderCalendar();
+ let created=0,updated=0,deleted=0,failed=0;
+ const failures=[];
+ try{
+  for(const l of lessons){
+   try{
+    if(l.status==="Cancelled"){
+     if(l.googleCalendarEventId){
       try{
-        if(l.status==="Cancelled"){
-          if(l.googleCalendarEventId){
-            try{
-              await calendarRequest("DELETE","/calendars/"+encodeURIComponent(GOOGLE_CALENDAR_ID)+"/events/"+encodeURIComponent(l.googleCalendarEventId));
-            }catch(e){
-              if(!String(e.message).includes("404")&&!String(e.message).includes("410"))throw e;
-            }
-            l.googleCalendarEventId=null;
-            l.googleCalendarSyncStatus="Cancelled event removed";
-            deleted++;
-          }
-          continue;
-        }
-        const payload=eventPayload(l);
-        if(l.googleCalendarEventId){
-          await calendarRequest("PUT","/calendars/"+encodeURIComponent(GOOGLE_CALENDAR_ID)+"/events/"+encodeURIComponent(l.googleCalendarEventId),payload);
-          l.googleCalendarSyncStatus="Synced";
-          updated++;
-        }else{
-          const createdEvent=await calendarRequest("POST","/calendars/"+encodeURIComponent(GOOGLE_CALENDAR_ID)+"/events",payload);
-          l.googleCalendarEventId=createdEvent.id;
-          l.googleCalendarSyncStatus="Synced";
-          created++;
-        }
-      }catch(e){
-        failed++;l.googleCalendarSyncStatus="Error: "+e.message;
-        failures.push((l.date||"No date")+" "+studentName(l.studentId)+": "+e.message);
-      }
+       await calendarRequest("DELETE","/calendars/"+encodeURIComponent(GOOGLE_CALENDAR_ID)+"/events/"+encodeURIComponent(l.googleCalendarEventId));
+      }catch(e){if(e.status!==404&&e.status!==410)throw e}
+      l.googleCalendarEventId=null;l.googleCalendarSyncStatus="Cancelled event removed";deleted++;
+     }
+     continue;
     }
-    save();
-    googleMessage="Sync finished. Created "+created+", updated "+updated+", removed "+deleted+", failed "+failed+".";
-    renderCalendar();
-    let message=googleMessage;
-    if(failures.length)message+="\n\nFirst errors:\n"+failures.slice(0,3).join("\n");
-    alert(message);
-  }catch(e){
-    googleMessage="Sync failed: "+e.message;renderCalendar();alert(googleMessage);
-  }finally{
-    googleBusy=false;
-    if(page==="calendar")renderCalendar();
+    const payload=eventPayload(l);
+    if(l.googleCalendarEventId){
+     await calendarRequest("PUT","/calendars/"+encodeURIComponent(GOOGLE_CALENDAR_ID)+"/events/"+encodeURIComponent(l.googleCalendarEventId),payload);
+     l.googleCalendarSyncStatus="Synced";updated++;
+    }else{
+     const stableId=stableEventId(l.id);
+     payload.id=stableId;
+     try{
+      const ev=await calendarRequest("POST","/calendars/"+encodeURIComponent(GOOGLE_CALENDAR_ID)+"/events",payload);
+      l.googleCalendarEventId=ev.id;l.googleCalendarSyncStatus="Synced";created++;
+     }catch(postError){
+      if(postError.status===409){
+       /* The stable event ID already exists, so update it instead of creating a duplicate. */
+       await calendarRequest("PUT","/calendars/"+encodeURIComponent(GOOGLE_CALENDAR_ID)+"/events/"+encodeURIComponent(stableId),eventPayload(l));
+       l.googleCalendarEventId=stableId;l.googleCalendarSyncStatus="Synced";updated++;
+      }else throw postError;
+     }
+    }
+   }catch(e){
+    failed++;l.googleCalendarSyncStatus="Error: "+e.message;
+    failures.push((l.date||"No date")+" "+studentName(l.studentId)+": "+e.message);
+   }
   }
+  save();
+  googleMessage="同步完成：新增 "+created+"、更新 "+updated+"、移除 "+deleted+"、失敗 "+failed+"。";
+  if(failures.length)googleMessage+=" 首項錯誤："+failures.slice(0,2).join("；");
+  if(!silent)alert(googleMessage);
+ }catch(e){
+  googleMessage="同步失敗："+e.message;
+  if(!silent)alert(googleMessage);
+ }finally{
+  googleBusy=false;
+  if(page==="calendar")renderCalendar();
+  if(googleSyncRequested&&googleAccessToken&&Date.now()<googleTokenExpiresAt)queueCalendarSync();
+ }
 }
-
 function renderBackup(){
-  app.innerHTML=`<h2>Backup & Restore</h2>
-  <div class="sub">Export or restore this browser's saved app data.</div>
-  <div class="notice"><b>Important:</b> Backup files contain student details. Keep them private. Importing does not change Google Calendar events automatically. Review calendar links before syncing.</div>
-
-  <div class="card">
-    <div class="item-title">1. Export backup</div>
-    <div class="meta">Download your current students, recurring classes and lessons.</div>
-    <button class="primary" id="exportBtn">Download backup file</button>
-  </div>
-
-  <div class="card">
-    <div class="item-title">2. Import backup</div>
-    <div class="meta">Import replaces the current students, recurring classes and lessons. First export your current data and verify that the JSON file exists in the iPhone Files app.</div>
-    <label>Select a backup JSON file</label>
-    <input id="importFile" type="file" accept=".json,application/json">
-    <label style="display:flex;gap:8px;align-items:flex-start">
-      <input id="backupConfirmed" type="checkbox" style="width:auto;margin-top:3px">
-      <span>I exported my current data and confirmed the backup file exists in Files.</span>
-    </label>
-    <button class="danger" id="importBtn">Import and replace data</button>
-  </div>
-
-  <div class="card">
-    <div class="item-title">Current data counts</div>
-    <div class="meta">Students: ${students.length}<br>Recurring classes: ${rules.length}<br>Lessons: ${lessons.length}</div>
-  </div>`;
-
-  document.getElementById("exportBtn").onclick=()=>{
-    downloadBackup({
-      app:"Little Artistz Manager",
-      version:3,
-      exportedAt:new Date().toISOString(),
-      students,rules,lessons
-    },"little-artistz-backup-"+todayISO()+".json");
-    alert("Backup download requested. Open Files and confirm the JSON file exists before importing.");
+ app.innerHTML=`<h2>Backup & Restore</h2><div class="sub">Export or restore this browser's saved app data.</div>
+ <div class="notice"><b>Important:</b> Backup files contain student details. Keep them private. Importing does not change Google Calendar events automatically. Review calendar links before syncing.</div>
+ <div class="card"><div class="item-title">1. Export backup</div><div class="meta">Download your current students, recurring classes and lessons.</div><button class="primary" id="exportBtn">Download backup file</button></div>
+ <div class="card"><div class="item-title">2. Import backup</div><div class="meta">Import replaces current data. First export your current data and verify the backup file exists in Files.</div>
+ <label>Select a backup JSON file</label><input id="importFile" type="file" accept=".json,application/json">
+ <label style="display:flex;gap:8px;align-items:flex-start"><input id="backupConfirmed" type="checkbox" style="width:auto;margin-top:3px"><span>I exported my current data and confirmed the backup file exists in Files.</span></label>
+ <button class="danger" id="importBtn">Import and replace data</button></div>
+ <div class="card"><div class="item-title">Current data counts</div><div class="meta">Students: ${students.length}<br>Recurring classes: ${rules.length}<br>Lessons: ${lessons.length}</div></div>`;
+ document.getElementById("exportBtn").onclick=()=>{
+  downloadBackup({app:"Little Artistz Manager",version:3,exportedAt:new Date().toISOString(),students,rules,lessons},"little-artistz-backup-"+todayISO()+".json");
+  alert("Backup download requested. Open Files and confirm the JSON file exists.");
+ };
+ document.getElementById("importBtn").onclick=()=>{
+  const file=document.getElementById("importFile").files[0],confirmed=document.getElementById("backupConfirmed").checked;
+  if(!confirmed){alert("Please export your current data and confirm the backup file exists first.");return}
+  if(!file){alert("Please choose a backup file first.");return}
+  if(file.size>5*1024*1024){alert("This backup file is larger than 5 MB.");return}
+  if(!confirm("Replace all current students, recurring classes and lessons? Google Calendar will not be changed automatically."))return;
+  const reader=new FileReader();
+  reader.onerror=()=>alert("Could not read this file. Current data has not been changed.");
+  reader.onload=()=>{
+   let data;
+   try{
+    data=JSON.parse(reader.result);
+    if(!data||data.app!=="Little Artistz Manager"||data.version!==3||!Array.isArray(data.students)||!Array.isArray(data.rules)||!Array.isArray(data.lessons))throw Error("Invalid backup");
+    const valid=(arr,keys)=>arr.every(x=>x&&typeof x==="object"&&!Array.isArray(x)&&keys.every(k=>Object.prototype.hasOwnProperty.call(x,k)));
+    if(!valid(data.students,["id","name"])||!valid(data.rules,["id","studentId","weekday","time"])||!valid(data.lessons,["id","studentId","date","time","status"]))throw Error("Invalid records");
+    const unique=arr=>{const ids=arr.map(x=>String(x.id));return ids.every(x=>x.trim()!=="")&&new Set(ids).size===ids.length};
+    if(!unique(data.students)||!unique(data.rules)||!unique(data.lessons))throw Error("Duplicate IDs");
+    if(data.students.some(x=>typeof x.name!=="string"||!x.name.trim()))throw Error("Invalid name");
+    const ids=new Set(data.students.map(x=>String(x.id)));
+    if(data.rules.some(x=>!ids.has(String(x.studentId))||!Number.isInteger(Number(x.weekday))||Number(x.weekday)<0||Number(x.weekday)>6||!/^\d{2}:\d{2}$/.test(String(x.time))))throw Error("Invalid recurring class");
+    if(data.lessons.some(x=>!ids.has(String(x.studentId))||!/^\d{4}-\d{2}-\d{2}$/.test(String(x.date))||!/^\d{2}:\d{2}$/.test(String(x.time))||typeof x.status!=="string"))throw Error("Invalid lesson");
+   }catch(e){alert("Import rejected: invalid backup. Current data has not been changed.");return}
+   const old={students,rules,lessons};
+   try{students=data.students;rules=data.rules;lessons=data.lessons;save()}
+   catch(e){students=old.students;rules=old.rules;lessons=old.lessons;alert("Import or saving failed. Check saved data before continuing.");renderBackup();return}
+   editingStudent=null;editingLesson=null;renderBackup();
+   alert("Import saved. Check all data before syncing. Google Calendar was not changed.");
   };
-
-  document.getElementById("importBtn").onclick=()=>{
-    const file=document.getElementById("importFile").files[0];
-    const confirmed=document.getElementById("backupConfirmed").checked;
-
-    if(!confirmed){
-      alert("Please export your current data and confirm the backup file exists in Files first.");
-      return;
-    }
-    if(!file){
-      alert("Please choose a backup file first.");
-      return;
-    }
-    if(file.size>5*1024*1024){
-      alert("This backup file is larger than 5 MB.");
-      return;
-    }
-    if(!confirm("Replace all current students, recurring classes and lessons with the selected backup? Google Calendar will not be changed automatically."))return;
-
-    const reader=new FileReader();
-
-    reader.onerror=()=>{
-      alert("Could not read this file. Current data has not been changed.");
-    };
-
-    reader.onload=()=>{
-      let data;
-
-      try{
-        data=JSON.parse(reader.result);
-
-        if(!data ||
-           data.app!=="Little Artistz Manager" ||
-           data.version!==3 ||
-           !Array.isArray(data.students) ||
-           !Array.isArray(data.rules) ||
-           !Array.isArray(data.lessons)){
-          throw Error("Invalid backup structure");
-        }
-
-        const validRecords=(arr,required)=>
-          arr.every(item=>
-            item && typeof item==="object" &&
-            !Array.isArray(item) &&
-            required.every(key=>
-              Object.prototype.hasOwnProperty.call(item,key)
-            )
-          );
-
-        if(
-          !validRecords(data.students,["id","name"]) ||
-          !validRecords(data.rules,["id","studentId","weekday","time"]) ||
-          !validRecords(data.lessons,["id","studentId","date","time","status"])
-        )throw Error("Invalid record structure");
-
-        const uniqueIds=arr=>{
-          const ids=arr.map(x=>String(x.id));
-          return ids.every(id=>id.trim()!=="") &&
-            new Set(ids).size===ids.length;
-        };
-
-        if(
-          !uniqueIds(data.students) ||
-          !uniqueIds(data.rules) ||
-          !uniqueIds(data.lessons)
-        )throw Error("Missing or duplicate IDs");
-
-        if(data.students.some(x=>typeof x.name!=="string"||!x.name.trim()))
-          throw Error("Invalid student name");
-
-        const studentIds=new Set(data.students.map(x=>String(x.id)));
-
-        if(data.rules.some(x=>
-          !studentIds.has(String(x.studentId)) ||
-          !Number.isInteger(Number(x.weekday)) ||
-          Number(x.weekday)<0 || Number(x.weekday)>6 ||
-          !/^\d{2}:\d{2}$/.test(String(x.time))
-        ))throw Error("Invalid recurring class");
-
-        if(data.lessons.some(x=>
-          !studentIds.has(String(x.studentId)) ||
-          !/^\d{4}-\d{2}-\d{2}$/.test(String(x.date)) ||
-          !/^\d{2}:\d{2}$/.test(String(x.time)) ||
-          typeof x.status!=="string"
-        ))throw Error("Invalid lesson");
-
-      }catch(e){
-        alert("Import rejected: the file is invalid or contains inconsistent records. Current data has not been changed.");
-        return;
-      }
-
-      const old={
-        students,rules,lessons,
-        editingStudent,editingLesson
-      };
-
-      try{
-        students=data.students;
-        rules=data.rules;
-        lessons=data.lessons;
-        save();
-      }catch(e){
-        students=old.students;
-        rules=old.rules;
-        lessons=old.lessons;
-        editingStudent=old.editingStudent;
-        editingLesson=old.editingLesson;
-
-        alert("Import or saving failed. The app restored its previous in-memory lists where possible. Do not continue editing until you have checked the saved data.");
-        renderBackup();
-        return;
-      }
-
-      editingStudent=null;
-      editingLesson=null;
-      renderBackup();
-
-      alert(
-        "Import saved. Please check the student, recurring class and lesson counts. Google Calendar was not changed. Do not sync until you have reviewed the imported lessons and their event links."
-      );
-    };
-
-    reader.readAsText(file);
-  };
+  reader.readAsText(file);
+ };
 }
-
 function downloadBackup(backup,filename){
-  const blob=new Blob(
-    [JSON.stringify(backup,null,2)],
-    {type:"application/json"}
-  );
-  const url=URL.createObjectURL(blob);
-  const a=document.createElement("a");
-  a.href=url;
-  a.download=filename;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  setTimeout(()=>URL.revokeObjectURL(url),1000);
+ const blob=new Blob([JSON.stringify(backup,null,2)],{type:"application/json"});
+ const url=URL.createObjectURL(blob),a=document.createElement("a");
+ a.href=url;a.download=filename;document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),1000);
 }
 
+/* On page load, do not silently open an OAuth popup. Reconnect manually if needed. */
 render();
 })();
 </script>
